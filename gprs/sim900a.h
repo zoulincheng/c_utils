@@ -17,7 +17,7 @@
 #define SIM900A_GPRS_ERROR			0x06		//附着GPRS出错
 #define SIM900A_GPRS_CONNECT_ERROR	0x07	//设置为GPRS连接模式
 #define SIM900A_IP_HEAD_ERROR		0x08		//设置接收数据显示IP头(方便判断数据来源)
-//#define SIM900A_TCPUDP_CLOSE		0x09
+#define SIM900A_TCPUDP_CLOSE_T		0x09
 #define SIM900A_TCPUDP_CONNECT		0x0a
 
 

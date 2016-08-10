@@ -160,24 +160,20 @@ PROCESS_THREAD(sim900a_hard_init, ev, data)
 	//gprs init
 	//RST
 	XPRINTF((0, "sim900a_hard_init\r\n"));
-	GPRS_SRST(1);
-	clock_wait(1);
 	GPRS_SRST(0);
-	etimer_set(&et_gprs, 1500);
-	PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_gprs));
-	//open
-	GPRS_PWRKEY(1);
-	etimer_set(&et_gprs, 1500);
-	PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_gprs));
+	GPRS_STATUS(0);
 	GPRS_PWRKEY(0);
-	
-	etimer_set(&et_gprs, 2000);
+	etimer_set(&et_gprs, 5000);
 	PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_gprs));
+
 	XPRINTF((0, "sim900a_hard_init2\r\n"));
 	process_start(&sim900a_check_process, NULL);
 
 	process_exit(&sim900a_hard_init);
-	
+	GPRS_SRST(1);
+	GPRS_STATUS(1);
+	GPRS_PWRKEY(1);
+	XPRINTF((0, "sim900a_hard_init2\r\n"));
 	PROCESS_END( );
 }
 
@@ -658,6 +654,7 @@ PROCESS_THREAD(sim900a_cfggprs_process, ev, data)
 PROCESS_THREAD(sim900a_tcpudp_con_process, ev, data)
 {
 	static u_char i = 0;
+	static u_char ubcount = 0;
 	static struct etimer et_tcpudp;
 	static u_char baBuf[128] = {0x00};
 	u_char *presp = NULL;
@@ -735,6 +732,7 @@ PROCESS_THREAD(sim900a_tcpudp_con_process, ev, data)
 	*/
 	
 	sim900a_send_cmd(baBuf);
+	ubcount = 0;
 	etimer_set(&et_tcpudp, 10*1000); //5s
 	while(1)
 	{
@@ -747,41 +745,116 @@ PROCESS_THREAD(sim900a_tcpudp_con_process, ev, data)
 		else if (ev == sim900_event_resp && data != NULL)
 		{
 			pcon_ok = sim900a_check_cmd((const char*)data,"CONNECT OK");
-			pcon_true = sim900a_check_cmd((const char*)data,"ALREADY CONNECT");
-			if (pcon_ok != NULL )
+			//pcon_true = sim900a_check_cmd((const char*)data,"ALREADY CONNECT");
+			if (pcon_ok != NULL)
 			{
 				gprsState = SIM900A_TCPUDP_CONNECT;
+				gprs_process = &sim900a_app_process;
+				etimer_stop(&et_tcpudp);
 				process_post(&sim900a_app_process, sim900_event_heart, NULL);
 				MEM_DUMP(10, "IPST", data, strlen(data));
 				break;
 			}
 		}
+		if (ubcount == 10)
+		{
+			ubcount= 0;
+			process_start(&sim900a_hard_init, NULL);
+			gprs_process = &sim900a_hard_init;
+			process_exit(&sim900a_tcpudp_con_process);
+		}
+		ubcount ++;
 	}
-	if (gprsState == SIM900A_TCPUDP_CONNECT)
-	{
-		gprs_process = &sim900a_app_process;
-		
-		process_exit(&sim900a_tcpudp_con_process);
-	}
+	//gprs_process = &sim900a_app_process;
+	XPRINTF((10, "sim900a_tcpudp_con_process exit\r\n"));
+	process_exit(&sim900a_tcpudp_con_process);
 	PROCESS_END( );
 }
 
 
 
-void gprsProtocolRxProcess(const u_char *pcFrame)
+void gprsProtocolRxProcess(const u_char *pcFrame, u_short uwSendSeq , struct etimer *petwait)
 {
-	
+	const GPRS_PROTOCOL * pGprs = (const GPRS_PROTOCOL *)pcFrame;
+	u_short uwSeq = pGprs->ubSeqL | (pGprs->ubSeqH << 8);
+
+	if (pGprs->ubCmd == GPRS_F_CMD_ACK)
+	{
+		if (uwSendSeq == uwSeq)
+		{
+			etimer_stop(petwait);
+		}
+	}
+	else if (pGprs->ubCmd == GPRS_F_CMD_DATA_SYNC)
+	{
+		SIM900A_MSG *ptxMsg = &sim900_tx;
+		static FIRE_NODE_INFO stFireNode;
+		const FIRE_NODE_INFO *pFireNodeInfo; 
+		NODE_ADDR_INFO *paddrInfo = (NODE_ADDR_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_ADDR_INFO);
+		int nFramL = -1;
+
+		memset(&stFireNode, 0, sizeof(FIRE_NODE_INFO));
+		pFireNodeInfo = (const FIRE_NODE_INFO *)pGprs->ubaData;
+		if (pFireNodeInfo->node_num > 0)
+		{
+			stFireNode.node_num = pFireNodeInfo->node_num;
+			memcpy(stFireNode.nodeArray, pFireNodeInfo->nodeArray, stFireNode.node_num*4);
+			extgdbdevSetDeviceSettingInfoSt(LABLE_FIRE_NODE_INFO, 0, (const void *)&stFireNode, sizeof(FIRE_NODE_INFO));
+		}
+		nFramL = gprsProtocolFrameFill(ptxMsg->ubamsg, GPRS_F_CMD_ACK, uwSeq, paddrInfo->ubaNodeAddr, NULL, 0);
+		if (nFramL > 0 && gprsState == SIM900A_TCPUDP_CONNECT)
+		{
+			ptxMsg->nLen = nFramL;
+			process_post(&sim900a_send_process, sim900_event_send_data,ptxMsg);
+		}
+	}
 }
+
+
+
+
+void fillNotNetNodeInfo(FIRE_NODE_INFO *pFireInfo)
+{
+	const FIRE_NODE_INFO *pfireNodeInfo = (const FIRE_NODE_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_FIRE_NODE_INFO);
+	int i = 0;
+	NODE_INFO *pnode = NULL;
+
+
+	//clear fire node info
+	if (pFireInfo != NULL)
+	{
+		memset(pFireInfo, 0, sizeof(FIRE_NODE_INFO));
+	}
+	
+	if (pfireNodeInfo->node_num == 0)
+	{
+		return;
+	}
+	
+	for(pnode = (NODE_INFO *)endNodeListHead(); pnode != NULL; pnode = (NODE_INFO *)endNodeListNext(pnode)) 
+	{
+		if (pnode->nodeNetState == HWGG_NODE_OUT_NET)
+		{
+			memcpy(pFireInfo->nodeArray[i++].ubaNodeAddr, pnode->ubaHWGGMacAddr, HWGG_NODE_MAC_LEN);
+		}
+	}
+
+	pFireInfo->node_num = i;
+}
+
+
+
 
 
 void sim900a_app_handler(process_event_t ev, process_data_t data)
 {
 	static u_char ubGprsRespType = SIM900A_RESP_STATUS;
 	static u_char ubaFireWarnBuf[32] = {0x00};
+	static u_char ubSendCmd;
 	static u_char ubSendState = SIM900A_SEND_NONE;
 	static struct etimer et_heart;
 	static struct etimer et_wait_ack;
-	static struct etimer et_warn_wait;
+	static FIRE_NODE_INFO stFireNodeInfo;
 	static u_short uwCurrentSeq = 0;
 	//XPRINTF((10, "grps app\r\n"));
 
@@ -791,12 +864,26 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 		if(sim900a_check_cmd((const char*)data,"CLOSED"))
 		{
 			gprs_process = &sim900a_check_process;
+			gprsState = SIM900A_TCPUDP_CLOSE_T;
+			sim900a_send_cmd("AT+CPOWD=1");
 			process_start(&sim900a_check_process, NULL);
+			XPRINTF((8, "ERROR\n"));
 		}
 		else if (sim900a_check_cmd((const char*)data,"ERROR"))
 		{
 			gprs_process = &sim900a_check_process;
-			process_start(&sim900a_check_process, NULL);			
+			gprsState = SIM900A_TCPUDP_CLOSE_T;
+			sim900a_send_cmd("AT+CPOWD=1");
+			process_start(&sim900a_check_process, NULL);
+			XPRINTF((8, "ERROR\n"));
+		}
+		else if (sim900a_check_cmd(((const char*)data),"SEND FAIL"))
+		{
+			gprs_process = &sim900a_check_process;
+			gprsState = SIM900A_TCPUDP_CLOSE_T;
+			sim900a_send_cmd("AT+CPOWD=1");
+			process_start(&sim900a_check_process, NULL);
+			XPRINTF((8, "ERROR\n"));			
 		}
 		else if (sim900a_check_cmd((const char*)data,"+IPD"))
 		{
@@ -814,7 +901,12 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 			memset(&sim900_app, 0, sizeof(SIM900A_MSG));
 			sim900_app.nLen = ubDataLen;
 			memcpy(sim900_app.ubamsg, pdataEnd+1, ubDataLen);
-			MEM_DUMP(7, "<-rx", sim900_app.ubamsg, ubDataLen);
+			
+			if (gprsProtocolCheck((const u_char *) sim900_app.ubamsg))
+			{
+				MEM_DUMP(7, "<-rx", sim900_app.ubamsg, ubDataLen);
+				gprsProtocolRxProcess((const u_char *) sim900_app.ubamsg,uwCurrentSeq, &et_wait_ack);
+			}
 		}
 		//> send data start flag
 		else if (sim900a_check_cmd((const char*)data,">"))
@@ -827,6 +919,24 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 			process_post(&sim900a_send_process, sim900_event_send_data_wait, data);
 			ubSendState = SIM900A_SEND_FINISH;
 		}
+		else 
+		{
+			const u_char *pHead = NULL;
+			pHead = (const u_char *)gprsProtocolFindHead((const u_char *)data);
+			if (pHead != NULL)
+			{
+				if (gprsProtocolCheck(pHead))
+				{
+					const GPRS_PROTOCOL *pGprs = (const GPRS_PROTOCOL *)pHead;
+					u_short uwLen = pGprs->ubDataLenL | (pGprs->ubDataLenH<<8) + 10;
+					memset(&sim900_app, 0, sizeof(SIM900A_MSG));
+					sim900_app.nLen = uwLen;
+					memcpy(sim900_app.ubamsg, pHead, uwLen);
+					MEM_DUMP(7, "<-Rx", sim900_app.ubamsg, uwLen);
+					gprsProtocolRxProcess((const u_char *) sim900_app.ubamsg,uwCurrentSeq, &et_wait_ack);
+				}
+			}
+		}
 	}
 
 	else if (ev == sim900_event_heart)
@@ -835,11 +945,20 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 		NODE_ADDR_INFO *paddrInfo = (NODE_ADDR_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_ADDR_INFO);
 		int nFramL = -1;
 		//XPRINTF((10, "heart1"));
-		nFramL = gprsProtocolFrameFill(ptxMsg->ubamsg, GPRS_F_CMD_HEART, uwSeq, paddrInfo->ubaNodeAddr, NULL, 0);
-		if (nFramL > 0)
+		fillNotNetNodeInfo(&stFireNodeInfo);
+		if (stFireNodeInfo.node_num > 0)
+		{
+			nFramL = gprsProtocolFrameFill(ptxMsg->ubamsg, GPRS_F_CMD_HEART, uwSeq, paddrInfo->ubaNodeAddr, (const u_char *)&stFireNodeInfo, stFireNodeInfo.node_num*4+2);
+		}
+		else
+		{
+			nFramL = gprsProtocolFrameFill(ptxMsg->ubamsg, GPRS_F_CMD_HEART, uwSeq, paddrInfo->ubaNodeAddr, NULL, 0);
+		}
+		if (nFramL > 0 && gprsState == SIM900A_TCPUDP_CONNECT)
 		{
 			ptxMsg->nLen = nFramL;
 			uwCurrentSeq = uwSeq;
+			ubSendCmd = GPRS_F_CMD_HEART;
 			process_post(&sim900a_send_process, sim900_event_send_data,ptxMsg);
 			etimer_set(&et_wait_ack, 10*1000);
 			ubSendState = SIM900A_SEND_START;
@@ -865,13 +984,14 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 		memcpy(ubaWarn, pFireNode->ubaSrcMac, HWGG_HEAD_END_CRC_LEN);
 		ubaWarn[4] = pFireNode->ubCmd;
 		uwSeq++;
-		nFramL = gprsProtocolFrameFill(ptxMsg->ubamsg, GPRS_F_CMD_HEART, uwSeq, paddrInfo->ubaNodeAddr, ubaWarn, 5);
-		if (nFramL > 0)
+		nFramL = gprsProtocolFrameFill(ptxMsg->ubamsg, GPRS_F_CMD_WARN, uwSeq, paddrInfo->ubaNodeAddr, ubaWarn, 5);
+		if (nFramL > 0 && gprsState == SIM900A_TCPUDP_CONNECT)
 		{
 			ptxMsg->nLen = nFramL;
 			uwCurrentSeq = uwSeq;
+			ubSendCmd = GPRS_F_CMD_WARN;
 			process_post(&sim900a_send_process, sim900_event_send_data,ptxMsg);
-			etimer_set(&et_warn_wait, 10*1000);
+			etimer_set(&et_wait_ack, 10*1000);
 			ubSendState = SIM900A_SEND_START;
 		}
 	}
@@ -885,20 +1005,14 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 	{
 		XPRINTF((10, "ack time out\n"));
 	}	
-
-	else if (ev == PROCESS_EVENT_TIMER && data == &et_warn_wait)
-	{
-		XPRINTF((10, "warn time out\n"));
-	}	
+	
 }
 
 //sim900a_app_process
 PROCESS_THREAD(sim900a_app_process, ev, data)
 {
 	PROCESS_BEGIN( );
-	//etimer_set(&et_gprs_status, 120*CLOCK_SECOND);
-	sim900a_send_cmd_wait_ack("AT+CIPSTATUS",&et_gprs_status,500);
-	
+	//sim900a_send_cmd_wait_ack("AT+CIPSTATUS",&et_gprs_status,500);
 	while(1)
 	{
 		PROCESS_YIELD( );
@@ -1025,6 +1139,7 @@ PROCESS_THREAD(gprs_resp_process, ev, data)
 			memcpy(sim900_rx.ubamsg, buf, ptr);
 			MEM_DUMP(8, "grev", buf, ptr);
 			process_post(gprs_process, sim900_event_resp, sim900_rx.ubamsg);
+			
 			memset(buf, 0 ,sizeof(buf));
 			ptr = 0;
 		}
@@ -1053,6 +1168,9 @@ PROCESS_THREAD(gprs_resp_process, ev, data)
 
 
 
+
+
+
 void sim900a_init(void)
 {
 	gprs_uart_init( );
@@ -1060,5 +1178,86 @@ void sim900a_init(void)
 	process_start(&gprs_resp_process, NULL);
 	process_start(&sim900a_app_process, NULL);
 	process_start(&sim900a_send_process, NULL);
+}
+
+
+/*This function is used to test*/
+/*
+test gprs ack
+*/
+void testGprsAck(void)
+{
+	int nFrameL = -1;
+	NODE_ADDR_INFO *paddrInfo = (NODE_ADDR_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_ADDR_INFO);
+	nFrameL = gprsProtocolFrameFill(sim900_tx.ubamsg, GPRS_F_CMD_ACK, uwSeq, paddrInfo->ubaNodeAddr, NULL, 0);
+	process_post(gprs_process, sim900_event_resp, sim900_tx.ubamsg);
+}
+
+/*
+test sync from pc
+*/
+typedef struct node_sync{
+	u_short uwNums;
+	u_char ubaBuf[160];
+}NODE_SYNC;
+
+NODE_SYNC nodeSync={
+	40,
+	{\
+	0x32,0x50,0x0E,0x33,\
+	0x01,0x00,0x00,0x00,\
+	0x02,0x00,0x00,0x00,\
+	0x03,0x00,0x00,0x00,\
+	0x04,0x00,0x00,0x00,\
+	0x05,0x00,0x00,0x00,\
+	0x06,0x00,0x00,0x00,\
+	0x07,0x00,0x00,0x00,\
+	0x08,0x00,0x00,0x00,\
+	0x09,0x00,0x00,0x00,\
+	0x10,0x00,0x00,0x00,\
+	0x11,0x00,0x00,0x00,\
+	0x12,0x00,0x00,0x00,\
+	0x13,0x00,0x00,0x00,\
+	0x14,0x00,0x00,0x00,\
+	0x15,0x00,0x00,0x00,\
+	0x16,0x00,0x00,0x00,\
+	0x17,0x00,0x00,0x00,\
+	0x18,0x00,0x00,0x00,\
+	0x19,0x00,0x00,0x00,\
+	0x20,0x00,0x00,0x00,\
+	0x21,0x00,0x00,0x00,\
+	0x22,0x00,0x00,0x00,\
+	0x23,0x00,0x00,0x00,\
+	0x24,0x00,0x00,0x00,\
+	0x25,0x00,0x00,0x00,\
+	0x26,0x00,0x00,0x00,\
+	0x27,0x00,0x00,0x00,\
+	0x28,0x00,0x00,0x00,\
+	0x29,0x00,0x00,0x00,\
+    0x30,0x00,0x00,0x00,\
+	0x31,0x00,0x00,0x00,\
+	0x32,0x00,0x00,0x00,\
+	0x33,0x00,0x00,0x00,\
+	0x34,0x00,0x00,0x00,\
+	0x35,0x00,0x00,0x00,\
+	0x36,0x00,0x00,0x00,\
+	0x37,0x00,0x00,0x00,\
+	0x38,0x00,0x00,0x00,\
+	0x39,0x00,0x00,0x00}
+};
+
+void testGprsSync(void)
+{
+	int nFrameL = -1;
+	NODE_ADDR_INFO *paddrInfo = (NODE_ADDR_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_ADDR_INFO);
+	nFrameL = gprsProtocolFrameFill(sim900_tx.ubamsg, GPRS_F_CMD_DATA_SYNC, uwSeq, paddrInfo->ubaNodeAddr, (const u_char *)&nodeSync, nodeSync.uwNums*4+2);
+	process_post(gprs_process, sim900_event_resp, sim900_tx.ubamsg);
+}
+
+
+void testNodeInfo(void)
+{
+	const FIRE_NODE_INFO *pFireNode = (const FIRE_NODE_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_FIRE_NODE_INFO);
+	MEM_DUMP(0, "fnod", pFireNode, sizeof(FIRE_NODE_INFO));
 }
 
