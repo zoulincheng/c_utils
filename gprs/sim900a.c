@@ -18,6 +18,8 @@ PROCESS(sim900a_app_process, "sim900a_app");
 PROCESS(sim900a_send_process, "sim900a_send");
 PROCESS(gprs_resp_process, "sim900a_resp");
 
+PROCESS(gprs_sms_phone_process, "sim900a_sms_phone");
+
 
 //receive data from sim900a
 process_event_t sim900_event_resp;
@@ -26,6 +28,11 @@ process_event_t sim900_event_send_data_wait;
 process_event_t	sim900_event_send_cmd;
 process_event_t	sim900_event_heart;
 process_event_t sim900_event_fire_warn;
+
+process_event_t sim900_event_start_sms_phone;
+process_event_t sim900_event_send_sms_phone;
+process_event_t sim900_event_send_sms;
+process_event_t sim900_event_send_sms_wait;
 
 
 #define TIME_CHECK_GPRS_AT		100
@@ -50,6 +57,12 @@ struct process *gprs_process = NULL;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 const u_char  *modetbl[2]={"TCP","UDP"};//连接模式
+
+
+//发生火灾报警
+//\u53d1\u751f\u706b\u707e\u62a5\u8b66
+//const u_char warnMsg[] = {0x53,0xd1,0x75,0x1f,0x70,0x6b,0x70,0x7e,0x62,0xa5,0x8b,0x66};
+const u_char warnMsg[] = "53d1751f706b707e62a58b66";
 
 
 /**
@@ -489,6 +502,7 @@ PROCESS_THREAD(sim900a_cfggprs_process, ev, data)
 	//if (gprsState == SIM900A_TCPUDP_OK)
 	#if 1
 	{
+		#if 0
 		//关闭连接
 		for (i = 0; i < ATCMD_MAX_REPEAT_NUMS; i++)
 		{
@@ -523,6 +537,7 @@ PROCESS_THREAD(sim900a_cfggprs_process, ev, data)
 				}
 			}
 		}
+		#endif
 	}
 
 	//设置GPRS移动台类别为B,支持包交换和数据交换 
@@ -615,6 +630,60 @@ PROCESS_THREAD(sim900a_cfggprs_process, ev, data)
 			}
 		}		
 	}
+
+	//设置短信发送参数  中英文短信的发送
+	for (i = 0; i < ATCMD_MAX_REPEAT_NUMS; i++)
+	{
+		sim900a_send_cmd("AT+CMGF=1");//文本模式
+		etimer_set(&et_cfggprs, 5*1000); //5s
+		PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_cfggprs) || ev == sim900_event_resp);
+		if (ev == sim900_event_resp && data != NULL)
+		{
+			presp = sim900a_check_cmd((const char*)data,"OK");
+			
+			MEM_DUMP(10, "CMGF", data, strlen(data));
+			if (presp != NULL)
+			{
+				etimer_stop(&et_cfggprs);
+				break;
+			}
+		}		
+	}
+	//AT+CSMP=17,167,2,25
+	for (i = 0; i < ATCMD_MAX_REPEAT_NUMS; i++)
+	{
+		sim900a_send_cmd("AT+CSMP=17,167,2,25");//文本模式参数
+		etimer_set(&et_cfggprs, 5*1000); //5s
+		PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_cfggprs) || ev == sim900_event_resp);
+		if (ev == sim900_event_resp && data != NULL)
+		{
+			presp = sim900a_check_cmd((const char*)data,"OK");
+			etimer_stop(&et_cfggprs);
+			MEM_DUMP(10, "CSMP", data, strlen(data));
+			if (presp != NULL)
+			{
+				break;
+			}
+		}		
+	}
+	//AT+CSCS="UCS2"
+	for (i = 0; i < ATCMD_MAX_REPEAT_NUMS; i++)
+	{
+		sim900a_send_cmd("AT+CSCS=\"UCS2\"");//
+		etimer_set(&et_cfggprs, 5*1000); //5s
+		PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_cfggprs) || ev == sim900_event_resp);
+		if (ev == sim900_event_resp && data != NULL)
+		{
+			presp = sim900a_check_cmd((const char*)data,"OK");
+			etimer_stop(&et_cfggprs);
+			MEM_DUMP(10, "CSMP", data, strlen(data));
+			if (presp != NULL)
+			{
+				break;
+			}
+		}		
+	}
+	
 	#else
 	etimer_set(&et_cfggprs, 5*1000); //5s
 	sim900a_send_cmd(gprs_cfg[i]);
@@ -773,11 +842,24 @@ PROCESS_THREAD(sim900a_tcpudp_con_process, ev, data)
 
 
 
+
+
+
+
+
+
+
+
+
+
 void gprsProtocolRxProcess(const u_char *pcFrame, u_short uwSendSeq , struct etimer *petwait)
 {
 	const GPRS_PROTOCOL * pGprs = (const GPRS_PROTOCOL *)pcFrame;
 	u_short uwSeq = pGprs->ubSeqL | (pGprs->ubSeqH << 8);
-
+	u_short uwLen = pGprs->ubDataLenL | (pGprs->ubDataLenH<<8);
+	static GPRS_WARN_PHONE stWarnPhone;
+	
+	
 	if (pGprs->ubCmd == GPRS_F_CMD_ACK)
 	{
 		if (uwSendSeq == uwSeq)
@@ -792,7 +874,7 @@ void gprsProtocolRxProcess(const u_char *pcFrame, u_short uwSendSeq , struct eti
 		const FIRE_NODE_INFO *pFireNodeInfo; 
 		NODE_ADDR_INFO *paddrInfo = (NODE_ADDR_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_ADDR_INFO);
 		int nFramL = -1;
-
+		
 		memset(&stFireNode, 0, sizeof(FIRE_NODE_INFO));
 		pFireNodeInfo = (const FIRE_NODE_INFO *)pGprs->ubaData;
 		if (pFireNodeInfo->node_num > 0)
@@ -806,6 +888,21 @@ void gprsProtocolRxProcess(const u_char *pcFrame, u_short uwSendSeq , struct eti
 		{
 			ptxMsg->nLen = nFramL;
 			process_post(&sim900a_send_process, sim900_event_send_data,ptxMsg);
+		}
+	}
+	else if (pGprs->ubCmd == GPRS_F_CMD_WARN_ACK)
+	{
+
+		if (uwSendSeq == uwSeq)
+		{
+			etimer_stop(petwait);
+		}
+		//clean warn phohe data
+		memset(&stWarnPhone, 0, sizeof(GPRS_WARN_PHONE));
+		if (uwLen-GPRS_F_MAC_LEN == 40)
+		{
+			memcpy(&stWarnPhone, pGprs->ubaData, 40);
+			process_post(&sim900a_app_process, sim900_event_start_sms_phone, &stWarnPhone);
 		}
 	}
 }
@@ -836,14 +933,24 @@ void fillNotNetNodeInfo(FIRE_NODE_INFO *pFireInfo)
 		if (pnode->nodeNetState == HWGG_NODE_OUT_NET)
 		{
 			memcpy(pFireInfo->nodeArray[i++].ubaNodeAddr, pnode->ubaHWGGMacAddr, HWGG_NODE_MAC_LEN);
+			XPRINTF((10, "i = %d\n", i));
+			MEM_DUMP(10, "OUT", pnode->ubaHWGGMacAddr, HWGG_NODE_MAC_LEN);
 		}
 	}
-
+	
 	pFireInfo->node_num = i;
 }
 
 
-
+void sim900a_reconnect(struct etimer *petHeart)
+{
+	gprs_process = &sim900a_check_process;
+	gprsState = SIM900A_TCPUDP_CLOSE_T;
+	sim900a_send_cmd("AT+CPOWD=1");
+	process_start(&sim900a_check_process, NULL);
+	XPRINTF((8, "ERROR\n"));
+	etimer_stop(petHeart);
+}
 
 
 void sim900a_app_handler(process_event_t ev, process_data_t data)
@@ -861,29 +968,26 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 	//revceive data process
 	if (ev == sim900_event_resp && data != NULL)
 	{
+		//tcp udp closed, connect again
 		if(sim900a_check_cmd((const char*)data,"CLOSED"))
 		{
-			gprs_process = &sim900a_check_process;
-			gprsState = SIM900A_TCPUDP_CLOSE_T;
-			sim900a_send_cmd("AT+CPOWD=1");
-			process_start(&sim900a_check_process, NULL);
-			XPRINTF((8, "ERROR\n"));
+			sim900a_reconnect(&et_heart);
 		}
+		//send error, connect again
 		else if (sim900a_check_cmd((const char*)data,"ERROR"))
 		{
-			gprs_process = &sim900a_check_process;
-			gprsState = SIM900A_TCPUDP_CLOSE_T;
-			sim900a_send_cmd("AT+CPOWD=1");
-			process_start(&sim900a_check_process, NULL);
-			XPRINTF((8, "ERROR\n"));
+			sim900a_reconnect(&et_heart);
 		}
+		//send error, connect again
 		else if (sim900a_check_cmd(((const char*)data),"SEND FAIL"))
 		{
-			gprs_process = &sim900a_check_process;
-			gprsState = SIM900A_TCPUDP_CLOSE_T;
-			sim900a_send_cmd("AT+CPOWD=1");
-			process_start(&sim900a_check_process, NULL);
-			XPRINTF((8, "ERROR\n"));			
+			sim900a_reconnect(&et_heart);
+		}
+		//have call. connect again
+		else if (sim900a_check_cmd(((const char*)data),"RING"))
+		{
+			sim900a_send_cmd("ATH");
+			sim900a_reconnect(&et_heart);		
 		}
 		else if (sim900a_check_cmd((const char*)data,"+IPD"))
 		{
@@ -948,6 +1052,7 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 		fillNotNetNodeInfo(&stFireNodeInfo);
 		if (stFireNodeInfo.node_num > 0)
 		{
+			
 			nFramL = gprsProtocolFrameFill(ptxMsg->ubamsg, GPRS_F_CMD_HEART, uwSeq, paddrInfo->ubaNodeAddr, (const u_char *)&stFireNodeInfo, stFireNodeInfo.node_num*4+2);
 		}
 		else
@@ -995,6 +1100,15 @@ void sim900a_app_handler(process_event_t ev, process_data_t data)
 			ubSendState = SIM900A_SEND_START;
 		}
 	}
+
+	else if (ev == sim900_event_start_sms_phone && data != NULL)
+	{
+		etimer_stop(&et_heart);
+		gprs_process = &gprs_sms_phone_process;
+		gprsState = SIM900A_TCPUDP_CLOSE_T;
+		process_post(&gprs_sms_phone_process, sim900_event_send_sms_phone, data);
+	}
+	
 	else if (ev == PROCESS_EVENT_TIMER && data == &et_heart)
 	{
 		process_post(&sim900a_app_process, sim900_event_heart, NULL);
@@ -1021,11 +1135,101 @@ PROCESS_THREAD(sim900a_app_process, ev, data)
 	PROCESS_END( );
 }
 
+
+
+
+
+void gprsSmsPhoneHandler(process_event_t ev, process_data_t data)
+{
+	static struct etimer et_wait_close;
+	static u_char ubCloseFlag = 0;
+	static GPRS_WARN_PHONE stPhone;
+
+	if (ev == sim900_event_send_sms_phone && data != NULL)
+	{
+		XPRINTF((10, "SEND SMS AND PHONE\r\n"));
+		//clear stphone
+		memset(&stPhone, 0, sizeof(GPRS_WARN_PHONE));
+		stPhone = *(GPRS_WARN_PHONE*)data;
+		MEM_DUMP(10, "PHON", &stPhone, sizeof(GPRS_WARN_PHONE));
+		sim900a_send_cmd("AT+CIPCLOSE=1");
+		sim900a_send_cmd("AT+CIPSHUT=1");
+		etimer_set(&et_wait_close, 5000);
+	}
+	else if (ev == sim900_event_resp && data != NULL)
+	{
+		//make sure tcp udp closed
+		if(sim900a_check_cmd((const char*)data,"CLOSE OK") || sim900a_check_cmd((const char*)data,"ERROR"))
+		{
+			ubCloseFlag = 1;
+			XPRINTF((10, "gpr1 is close\r\n"));
+			etimer_stop(&et_wait_close);
+			process_post(&sim900a_send_process, sim900_event_send_sms, &stPhone);
+		}
+		else if (sim900a_check_cmd((const char*)data,">"))
+		{
+			process_post(&sim900a_send_process, sim900_event_send_sms_wait, data);
+		}
+		else if (sim900a_check_cmd((const char*)data,"+CMGS"))
+		{
+			XPRINTF((10, "SMSOK\n"));
+		}
+	}
+	else if (ev == PROCESS_EVENT_TIMER && data == &et_wait_close)
+	{
+		if (ubCloseFlag == 0)
+		{
+			sim900a_send_cmd("AT+CIPCLOSE=1");
+			sim900a_send_cmd("AT+CIPSHUT=1");	
+		}
+		process_post(&sim900a_send_process, sim900_event_send_sms, &stPhone);
+	}
+}
+
+PROCESS_THREAD(gprs_sms_phone_process, ev, data)
+{
+
+	PROCESS_BEGIN( );
+	//关闭连接
+	while (1)
+	{
+		PROCESS_YIELD( );
+		gprsSmsPhoneHandler(ev, data);
+	}
+	PROCESS_END( );
+}
+
+
+int asiicToUTF8(u_char *pUTF8, const u_char *pasiic)
+{
+	u_char ubasiicLen = strlen(pasiic);
+	u_char utf8Len = 0;
+	int i = 0;
+	XPRINTF((10, "asiic len = %d\n", ubasiicLen));
+	for (i = 0; i < ubasiicLen; i++)
+	{
+		pUTF8[2*i] = 0x00;
+		pUTF8[2*i+1] = pasiic[i];
+	}
+	utf8Len = ubasiicLen<<1;
+	MEM_DUMP(10, "UTF8", pUTF8, utf8Len);
+	return utf8Len;
+}
+
+
 void sim900a_send_handler(process_event_t ev, process_data_t data)
 {
 	static const SIM900A_MSG *psendMsg = NULL;
+	static u_char ubPhoneIndex = 0;
+	static u_char ubUTF8Buf[32] = {0x00};
+	static u_char ubasiicBuf[64] = {0x00};
+	static u_char ubcmdBuf[128] = {0x00};
 	static u_char sendState = SIM900A_SEND_NONE;
 	static struct etimer et_send;
+	static struct etimer et_wait_sms_ok;
+	static struct etimer et_phone;
+	static struct etimer et_back_udp;
+	static GPRS_WARN_PHONE stPhone;
 
 	if (ev == sim900_event_send_data && data != NULL)
 	{
@@ -1052,9 +1256,71 @@ void sim900a_send_handler(process_event_t ev, process_data_t data)
 			sendState = SIM900A_SEND_FINISH;
 		}
 	}
+	//send sms
+	else if (ev == sim900_event_send_sms && data != NULL)
+	{
+		u_char ubLen;
+		int nLen = 0;
+		if (ubPhoneIndex > 1)
+		{
+			ubPhoneIndex = 0;
+		}
+		if ((u_long)&stPhone != (u_long)data)
+		{
+			stPhone = *(GPRS_WARN_PHONE*)data;
+		}
+		MEM_DUMP(10, "SMSH", &stPhone, sizeof(GPRS_WARN_PHONE));
+		memset(ubUTF8Buf, 0, sizeof(ubUTF8Buf));
+		memset(ubasiicBuf, 0, sizeof(ubUTF8Buf));
+		memset(ubcmdBuf, 0, sizeof(ubcmdBuf));
+		if (ubPhoneIndex == 0)
+		{
+			ubLen = asiicToUTF8(ubUTF8Buf, stPhone.ubaPhoneA);
+			etimer_set(&et_back_udp, 180 * 1000);
+		}
+		else
+		{
+			ubLen = asiicToUTF8(ubUTF8Buf, stPhone.ubaPhoneB);
+		}
+		nLen = hex2ascii((const uint8 *)ubUTF8Buf, ubasiicBuf, ubLen);
+		MEM_DUMP(10, "ASIC", ubasiicBuf, nLen);
+		XPRINTF((10, "asic nlen =%d\n", strlen(ubasiicBuf)));
+		xsprintf(ubcmdBuf,"AT+CMGS=\"%s\"",ubasiicBuf);
+		sim900a_send_cmd(ubcmdBuf);
+		etimer_set(&et_wait_sms_ok, 20*1000);
+	}
+	else if (ev == sim900_event_send_sms_wait && data != NULL)
+	{
+		if (sim900a_check_cmd((const char*)data,">"))
+		{
+			uart4_send_bytes(warnMsg, strlen(warnMsg));
+			uart4_send_char(0x1a);
+			sendState = SIM900A_SEND_START;
+		}
+	}
+	
 	else if (ev == PROCESS_EVENT_TIMER && data == &et_send)
 	{
 		XPRINTF((12, "UDP SEND TIME OUT\n"));
+	}
+
+	else if (ev == PROCESS_EVENT_TIMER && data == &et_wait_sms_ok)
+	{
+		ubPhoneIndex++;
+		if (ubPhoneIndex <=1)
+		{
+			process_post(&sim900a_send_process, sim900_event_send_sms, &stPhone);
+		}
+		else
+		{
+			
+		}
+	}
+	else if (ev == PROCESS_EVENT_TIMER && data == &et_back_udp)
+	{
+		gprs_process = &sim900a_check_process;
+		gprsState = SIM900A_TCPUDP_CLOSE_T;
+		process_start(&sim900a_check_process, NULL);		
 	}
 }
 //PROCESS(sim900a_send_process, "sim900a_send");
@@ -1116,7 +1382,7 @@ PROCESS_THREAD(gprs_resp_process, ev, data)
 {
 	static char buf[SIMG900A_MAX_TCPUDP_DATA_LEN];
 	static struct etimer et_rev_timeout;
-	static int ptr;
+	static int ptr = 0;
 	int c;
 	
 	PROCESS_BEGIN();
@@ -1126,6 +1392,10 @@ PROCESS_THREAD(gprs_resp_process, ev, data)
 	sim900_event_heart = process_alloc_event( );
 	sim900_event_send_data_wait = process_alloc_event( );
 	sim900_event_fire_warn = process_alloc_event( );
+	sim900_event_start_sms_phone = process_alloc_event( );
+	sim900_event_send_sms_phone = process_alloc_event( );
+	sim900_event_send_sms = process_alloc_event( );
+	sim900_event_send_sms_wait = process_alloc_event( );
 	XPRINTF((10, "sim900a_resp_process\r\n"));
 	
 	while(1) 
@@ -1151,15 +1421,23 @@ PROCESS_THREAD(gprs_resp_process, ev, data)
 		} 
 		else 
 		{
-			if (ptr < SIMG900A_MAX_TCPUDP_DATA_LEN)
+			//XPRINTF((10 "c = %02x\n", c));
+			//XPRINTF((9, "%02x\r\n", c));
+			if (ptr == 0 && (uint8_t)c != 0x0d)
 			{
-				buf[ptr++] = (uint8_t)c;
-				etimer_set(&et_rev_timeout, 50);
-				//XPRINTF((6, "%02x \r\n", c));
+				ptr = 0;
 			}
 			else
 			{
-				ptr = 0;
+				buf[ptr++] = (uint8_t)c;
+				if (ptr < SIMG900A_MAX_TCPUDP_DATA_LEN)
+				{
+					etimer_set(&et_rev_timeout, 200);
+				}
+				else
+				{
+					ptr = 0;
+				}				
 			}
 		}
 	}
@@ -1178,6 +1456,7 @@ void sim900a_init(void)
 	process_start(&gprs_resp_process, NULL);
 	process_start(&sim900a_app_process, NULL);
 	process_start(&sim900a_send_process, NULL);
+	process_start(&gprs_sms_phone_process, NULL);
 }
 
 
@@ -1259,5 +1538,17 @@ void testNodeInfo(void)
 {
 	const FIRE_NODE_INFO *pFireNode = (const FIRE_NODE_INFO *)extgdbdevGetDeviceSettingInfoSt(LABLE_FIRE_NODE_INFO);
 	MEM_DUMP(0, "fnod", pFireNode, sizeof(FIRE_NODE_INFO));
+}
+
+void testGprsSmsPhone(void)
+{
+	const u_char phoneNum[]="18820109265";
+	static GPRS_WARN_PHONE stPhone = {0};
+	memcpy(stPhone.ubaPhoneA, phoneNum, sizeof(phoneNum));
+	memcpy(stPhone.ubaPhoneB, phoneNum, sizeof(phoneNum));
+
+	MEM_DUMP(10, "phone", &stPhone, sizeof(GPRS_WARN_PHONE));
+
+	process_post(&sim900a_app_process, sim900_event_start_sms_phone, &stPhone);
 }
 
